@@ -253,6 +253,7 @@ func (o *CreateOptions) Run(c *cobra.Command, f client.Factory) error {
 		return err
 	}
 
+	fmt.Println("=========== Creating backup that will use kubectx", f.RemoteKubectx(), "===============")
 	fmt.Printf("Backup request %q submitted successfully.\n", backup.Name)
 	if o.Wait {
 		fmt.Println("Waiting for backup to complete. You may safely press ctrl-c to stop waiting - your backup will continue in the background.")

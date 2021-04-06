@@ -126,7 +126,7 @@ type controllerRunInfo struct {
 	numWorkers int
 }
 
-func NewCommand(f client.Factory) *cobra.Command {
+func NewCommand(f, remoteFactory client.Factory) *cobra.Command {
 	var (
 		volumeSnapshotLocations = flag.NewMap().WithKeyValueDelimiter(":")
 		logLevelFlag            = logging.LogLevelFlag(logrus.InfoLevel)
@@ -184,8 +184,9 @@ func NewCommand(f client.Factory) *cobra.Command {
 
 			f.SetBasename(fmt.Sprintf("%s-%s", c.Parent().Name(), c.Name()))
 
-			s, err := newServer(f, config, logger)
+			s, err := newServer(f, remoteFactory, config, logger)
 			cmd.CheckError(err)
+			fmt.Println("namespace:", s.namespace, "remote kubectx:", s.remoteKubectx)
 
 			cmd.CheckError(s.run())
 		},
@@ -221,8 +222,14 @@ type server struct {
 	kubeClient                          kubernetes.Interface
 	veleroClient                        clientset.Interface
 	discoveryClient                     discovery.DiscoveryInterface
-	discoveryHelper                     velerodiscovery.Helper
 	dynamicClient                       dynamic.Interface
+	discoveryHelper                     velerodiscovery.Helper
+	remoteKubeClientConfig              *rest.Config
+	remoteKubeClient                    kubernetes.Interface
+	remoteVeleroClient                  clientset.Interface
+	remoteDiscoveryClient               discovery.DiscoveryInterface
+	remoteDynamicClient                 dynamic.Interface
+	remoteKubectx                       string
 	sharedInformerFactory               informers.SharedInformerFactory
 	csiSnapshotterSharedInformerFactory *CSIInformerFactoryWrapper
 	csiSnapshotClient                   *snapshotv1beta1client.Clientset
@@ -238,7 +245,7 @@ type server struct {
 	credentialFileStore                 credentials.FileStore
 }
 
-func newServer(f client.Factory, config serverConfig, logger *logrus.Logger) (*server, error) {
+func newServer(f, remoteFactory client.Factory, config serverConfig, logger *logrus.Logger) (*server, error) {
 	if config.clientQPS < 0.0 {
 		return nil, errors.New("client-qps must be positive")
 	}
@@ -254,12 +261,27 @@ func newServer(f client.Factory, config serverConfig, logger *logrus.Logger) (*s
 		return nil, err
 	}
 
+	remoteKubeClient, err := remoteFactory.KubeClient()
+	if err != nil {
+		return nil, err
+	}
+
 	veleroClient, err := f.Client()
 	if err != nil {
 		return nil, err
 	}
 
+	remoteVeleroClient, err := remoteFactory.Client()
+	if err != nil {
+		return nil, err
+	}
+
 	dynamicClient, err := f.DynamicClient()
+	if err != nil {
+		return nil, err
+	}
+
+	remoteDynamicClient, err := remoteFactory.DynamicClient()
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +298,11 @@ func newServer(f client.Factory, config serverConfig, logger *logrus.Logger) (*s
 	ctx, cancelFunc := context.WithCancel(context.Background())
 
 	clientConfig, err := f.ClientConfig()
+	if err != nil {
+		cancelFunc()
+		return nil, err
+	}
+	remoteClientConfig, err := remoteFactory.ClientConfig()
 	if err != nil {
 		cancelFunc()
 		return nil, err
@@ -321,6 +348,12 @@ func newServer(f client.Factory, config serverConfig, logger *logrus.Logger) (*s
 		veleroClient:                        veleroClient,
 		discoveryClient:                     veleroClient.Discovery(),
 		dynamicClient:                       dynamicClient,
+		remoteKubeClientConfig:              remoteClientConfig,
+		remoteKubeClient:                    remoteKubeClient,
+		remoteVeleroClient:                  remoteVeleroClient,
+		remoteDiscoveryClient:               remoteVeleroClient.Discovery(),
+		remoteDynamicClient:                 remoteDynamicClient,
+		remoteKubectx:                       remoteFactory.RemoteKubectx(),
 		sharedInformerFactory:               informers.NewSharedInformerFactoryWithOptions(veleroClient, 0, informers.WithNamespace(f.Namespace())),
 		csiSnapshotterSharedInformerFactory: NewCSIInformerFactoryWrapper(csiSnapClient),
 		csiSnapshotClient:                   csiSnapClient,
@@ -355,9 +388,12 @@ func (s *server) run() error {
 		return err
 	}
 
-	if err := s.veleroResourcesExist(); err != nil {
-		return err
-	}
+	// Commented out for remote-velero hack because requires discovery
+	// and discovery uses remote cluster's kubeconfig. No velero resources
+	// are supposed to exist on the remote cluster.
+	// if err := s.veleroResourcesExist(); err != nil {
+	// 	return err
+	// }
 
 	if err := s.initRestic(); err != nil {
 		return err
@@ -380,13 +416,20 @@ func (s *server) namespaceExists(namespace string) error {
 	}
 
 	s.logger.WithField("namespace", namespace).Info("Namespace exists")
+
+	if s.remoteKubectx == "" {
+		s.logger.Info("No remote kube context set")
+
+	} else {
+		s.logger.Infof("Remote kube context has been set: %v", s.remoteKubectx)
+	}
 	return nil
 }
 
 // initDiscoveryHelper instantiates the server's discovery helper and spawns a
 // goroutine to call Refresh() every 5 minutes.
 func (s *server) initDiscoveryHelper() error {
-	discoveryHelper, err := velerodiscovery.NewHelper(s.discoveryClient, s.logger)
+	discoveryHelper, err := velerodiscovery.NewHelper(s.remoteDiscoveryClient, s.logger)
 	if err != nil {
 		return err
 	}
@@ -605,8 +648,8 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 		backupper, err := backup.NewKubernetesBackupper(
 			s.veleroClient.VeleroV1(),
 			s.discoveryHelper,
-			client.NewDynamicFactory(s.dynamicClient),
-			podexec.NewPodCommandExecutor(s.kubeClientConfig, s.kubeClient.CoreV1().RESTClient()),
+			client.NewDynamicFactory(s.remoteDynamicClient),
+			podexec.NewPodCommandExecutor(s.remoteKubeClientConfig, s.remoteKubeClient.CoreV1().RESTClient()),
 			s.resticManager,
 			s.config.podVolumeOperationTimeout,
 			s.config.defaultVolumesToRestic,
@@ -702,17 +745,17 @@ func (s *server) runControllers(defaultVolumeSnapshotLocations map[string]string
 
 	restoreControllerRunInfo := func() controllerRunInfo {
 		restorer, err := restore.NewKubernetesRestorer(
-			s.veleroClient.VeleroV1(),
+			s.remoteVeleroClient.VeleroV1(),
 			s.discoveryHelper,
-			client.NewDynamicFactory(s.dynamicClient),
+			client.NewDynamicFactory(s.remoteDynamicClient),
 			s.config.restoreResourcePriorities,
-			s.kubeClient.CoreV1().Namespaces(),
+			s.remoteKubeClient.CoreV1().Namespaces(),
 			s.resticManager,
 			s.config.podVolumeOperationTimeout,
 			s.config.resourceTerminatingTimeout,
 			s.logger,
-			podexec.NewPodCommandExecutor(s.kubeClientConfig, s.kubeClient.CoreV1().RESTClient()),
-			s.kubeClient.CoreV1().RESTClient(),
+			podexec.NewPodCommandExecutor(s.remoteKubeClientConfig, s.remoteKubeClient.CoreV1().RESTClient()),
+			s.remoteKubeClient.CoreV1().RESTClient(),
 		)
 		cmd.CheckError(err)
 

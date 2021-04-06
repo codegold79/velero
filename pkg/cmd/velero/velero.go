@@ -89,18 +89,20 @@ operations can also be performed as 'velero backup get' and 'velero schedule cre
 
 	f := client.NewFactory(name, config)
 	f.BindFlags(c.PersistentFlags())
-
+	
 	// Bind features directly to the root command so it's available to all callers.
 	c.PersistentFlags().Var(&cmdFeatures, "features", "Comma-separated list of features to enable for this Velero process. Combines with values from $HOME/.config/velero/config.json if present")
 
 	// Color will be enabled or disabled for all subcommands
 	c.PersistentFlags().Var(&cmdColorzied, "colorized", "Show colored output in TTY. Overrides 'colorized' value from $HOME/.config/velero/config.json if present. Enabled by default")
 
+	remoteFactory := client.WithRemoteKubeCtx(f)
+
 	c.AddCommand(
-		backup.NewCommand(f),
+		backup.NewCommand(remoteFactory),
 		schedule.NewCommand(f),
-		restore.NewCommand(f),
-		server.NewCommand(f),
+		restore.NewCommand(remoteFactory),
+		server.NewCommand(f, remoteFactory),
 		version.NewCommand(f),
 		get.NewCommand(f),
 		install.NewCommand(f),

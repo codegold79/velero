@@ -60,16 +60,19 @@ type Factory interface {
 	ClientConfig() (*rest.Config, error)
 	// Namespace returns the namespace which the Factory will create clients for.
 	Namespace() string
+	// RemoteKubectx returns the remote kubecontext.
+	RemoteKubectx() string
 }
 
 type factory struct {
-	flags       *pflag.FlagSet
-	kubeconfig  string
-	kubecontext string
-	baseName    string
-	namespace   string
-	clientQPS   float32
-	clientBurst int
+	flags         *pflag.FlagSet
+	kubeconfig    string
+	kubecontext   string
+	remoteKubectx string
+	baseName      string
+	namespace     string
+	clientQPS     float32
+	clientBurst   int
 }
 
 // NewFactory returns a Factory.
@@ -90,11 +93,25 @@ func NewFactory(baseName string, config VeleroConfig) Factory {
 		f.namespace = velerov1api.DefaultNamespace
 	}
 
+	// The following do not seem to work...
 	f.flags.StringVar(&f.kubeconfig, "kubeconfig", "", "Path to the kubeconfig file to use to talk to the Kubernetes apiserver. If unset, try the environment variable KUBECONFIG, as well as in-cluster configuration")
 	f.flags.StringVarP(&f.namespace, "namespace", "n", f.namespace, "The namespace in which Velero should operate")
-	f.flags.StringVar(&f.kubecontext, "kubecontext", "", "The context to use to talk to the Kubernetes apiserver. If unset defaults to whatever your current-context is (kubectl config current-context)")
+	f.flags.StringVar(&f.kubecontext, "kubecontext", "", "The context to use to talk to the Kubernetes apiserver. If unset it defaults to whatever your current-context is (kubectl config current-context)")
+	f.flags.StringVarP(&f.remoteKubectx, "remote-kubectx", "r", "", "The remote k8s context to use to talk to the Kubernetes apiserver. If unset it defaults to 'kind-remote-cluster')")
 
 	return f
+}
+
+// WithRemoteKubeCtx returns a Factory used for a remote cluster.
+func WithRemoteKubeCtx(origFactory Factory) Factory {
+	rf := *origFactory.(*factory)
+
+	if rf.remoteKubectx == "" {
+		rf.remoteKubectx = os.Getenv("VELERO_REMOTE_KUBECTX")
+		rf.kubecontext = rf.remoteKubectx
+	}
+
+	return &rf
 }
 
 func (f *factory) BindFlags(flags *pflag.FlagSet) {
@@ -176,4 +193,8 @@ func (f *factory) SetClientBurst(burst int) {
 
 func (f *factory) Namespace() string {
 	return f.namespace
+}
+
+func (f *factory) RemoteKubectx() string {
+	return f.remoteKubectx
 }
